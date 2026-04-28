@@ -1,0 +1,1366 @@
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from dataclasses import asdict
+from src.my_engine.config import ModelConfig, ResidualBlockConfig
+
+
+def _construct_fc_layers(start_layer_size: int, config: ModelConfig, num_outputs: int) -> nn.Sequential:
+    """Build a fully-connected classifier head.
+
+    Constructs a stack of Linear -> ReLU -> Dropout layers from config.hidden_units
+    and config.dropout, followed by a final Linear(last_hidden, num_outputs) layer.
+
+    Args:
+        start_layer_size: Input feature dimension to the first linear layer.
+        config: ModelConfig supplying hidden_units and dropout lists.
+        num_outputs: Number of output logits for the final linear layer.
+
+    Returns:
+        nn.Sequential containing the complete classifier head.
+    """
+    layers = []
+    prev_size = start_layer_size
+    for i, hidden_size in enumerate(config.hidden_units):
+        layers.append(nn.Linear(prev_size, hidden_size))
+        layers.append(nn.ReLU())
+        if i < len(config.dropout):
+            layers.append(nn.Dropout(config.dropout[i]))
+        prev_size = hidden_size
+    layers.append(nn.Linear(prev_size, num_outputs))
+    return nn.Sequential(*layers)
+
+
+class MLP_Model(nn.Module):
+    def __init__(self, num_inputs: int, num_outputs: int, config: ModelConfig):
+        super().__init__()
+        # DONE: Implement the initialization of the MLP model.
+        layers = []
+        prev_dim = num_inputs
+        for next_dim, dropout in zip(config.hidden_units, config.dropout):
+            layers.append(nn.Linear(prev_dim, next_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))
+
+            prev_dim = next_dim
+
+        layers.append(nn.Linear(prev_dim, num_outputs))
+
+        self.model = nn.Sequential(*layers)
+        self.num_inputs = num_inputs
+        self.num_outputs = num_outputs
+        self.config = config
+
+    def forward(self, x):
+        # DONE: Implement the forward pass of the MLP model.
+        x = torch.flatten(x, 1)
+        return self.model(x)
+
+    def num_parameters(self) -> tuple[int, int]:
+        # DONE: Implement the number of parameters of the MLP model.
+        total_parameters = sum([x.numel() for x in self.model.parameters()])
+        trainable_params = sum([x.numel() for x in self.model.parameters() if x.requires_grad])
+        return total_parameters, trainable_params
+
+    def __str__(self) -> str:
+        # DONE: Implement the string representation of the MLP model.
+        return_str = f"MLP_Model(num_inputs={self.num_inputs}, num_outputs={self.num_outputs}, config={self.config})"
+        return return_str
+
+    def __repr__(self) -> str:
+        # DONE: Implement the representation of the MLP model.
+        return self.model.__repr__()
+
+    def get_architecture_config(self) -> dict:
+        """
+        This method returns a dictionary of the model architecture configuration
+        :return: dictionary of the model architecture configuration
+        """
+        return {
+            'model_type': self.config.model_type,
+            'num_inputs': self.num_inputs,
+            'num_outputs': self.num_outputs,
+            'config': asdict(self.config)
+        }
+
+
+class ResidualBlock(nn.Module):
+    """
+    Implements a single residual block inspired by the architecture introduced in ResNet (He et al., 2015).
+
+    This block consists of two convolutional layers each followed by batch normalization,
+    with a skip connection (shortcut path) from the input to the output. The main idea
+    is to allow the network to learn residual mappings, which helps in training deeper
+    neural networks by alleviating the vanishing gradient problem and making optimization easier.
+
+    Architecture:
+        x --> Conv -> BN -> ReLU -> Conv -> BN --> (+) -> ReLU -> out
+        |                                          ^
+        └──────────── shortcut (identity or 1x1) ──┘
+
+    If in_channels != out_channels or stride != 1, the shortcut uses a 1x1 convolution (with batch norm)
+    to match the shape of the main path; otherwise, it is the identity.
+
+    References:
+        Kaiming He, Xiangyu Zhang, Shaoqing Ren, Jian Sun.
+        "Deep Residual Learning for Image Recognition." arXiv preprint arXiv:1512.03385 (2015).
+    """
+
+    def __init__(self, in_channels: int, res_config: ResidualBlockConfig):
+        super().__init__()
+        # DONE: Build the two-conv "residual path", and don't forget that no bias is
+        # necessary for the convolutions because batch norm has its own bias.
+        self.conv_list = nn.Sequential(nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1),
+                     nn.BatchNorm2d(in_channels), nn.ReLU(),
+                     nn.Conv2d(in_channels, res_config.out_channels, kernel_size=3, stride=1, padding=1),
+                     nn.BatchNorm2d(res_config.out_channels))
+
+        # DONE: Build the shortcut path
+        # If dimensions change, use a 1x1 conv to project x to the right shape.
+        # Otherwise, the shortcut is just the identity (nn.Sequential() with no layers).
+        self.shortcut = nn.Sequential()
+        if res_config.stride != 1 or in_channels != res_config.out_channels:
+            self.shortcut = nn.Conv2d(in_channels, res_config.out_channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # DONE: Implement the forward pass
+        # 1. Pass x through conv1 -> bn1 -> relu
+        # 2. Pass through conv2 -> bn2
+        # 3. Add the shortcut(x)
+        # 4. Apply final ReLU
+        out = self.conv_list(x)
+        out += self.shortcut(x)
+        return nn.ReLU()(out)
+
+
+class CNN_Model(nn.Module):
+    """Convolutional Neural Network following the [Conv2d -> ReLU -> MaxPool2d] x N motif.
+
+    The model consists of:
+      - A feature extractor: sequential conv blocks built from config.conv_blocks
+      - A classifier head: Flatten -> Linear layers with dropout
+
+    The flattened feature dimension is computed automatically via a dummy forward pass,
+    so the model adapts to any input spatial size without manual calculation.
+    """
+
+    def __init__(self, input_height: int, input_width: int, num_outputs: int, config: ModelConfig) -> None:
+        super().__init__()
+
+        if config.model_type != "cnn":
+            raise ValueError(f"Invalid model_type: {config.model_type}. Expected 'cnn'.")
+
+        self.input_height = input_height
+        self.input_width = input_width
+        self.num_outputs = num_outputs
+        self.config = config
+
+        # --- Build the feature extractor ---
+        # DONE: Build self.feature_extractor as an nn.Sequential.
+        # Your list of layers in self.feature_extractor is determined by your config.conv_blocks.
+        # Loop through config.conv_blocks. For each ConvBlockConfig, append:
+        #   nn.Conv2d(parameters from block configg)
+        #   nn.ReLU()
+        #   nn.MaxPool2d(pool_size from block config) <-- only if block.pool_size > 0
+        # Track current_in_channels: starts at config.in_channels, then becomes block.out_channels.
+        conv_layers = nn.ModuleList()
+        prev_in_channel = self.config.in_channels
+        for conv_block in config.conv_blocks:
+            if conv_block.__class__.__name__ == "ResidualBlockConfig":
+                conv_layers.append(ResidualBlock(prev_in_channel, conv_block))
+                conv_layers.append(nn.MaxPool2d(2))
+            else:
+                conv_layers.append(nn.Conv2d(prev_in_channel, conv_block.out_channels, conv_block.kernel_size,
+                                             stride=conv_block.stride, padding=conv_block.padding))
+                if conv_block.batch_norm:
+                    conv_layers.append(nn.BatchNorm2d(conv_block.out_channels))
+                conv_layers.append(nn.ReLU())
+
+                if conv_block.pool_size > 0:
+                    conv_layers.append(nn.MaxPool2d(conv_block.pool_size))
+            prev_in_channel = conv_block.out_channels
+        self.feature_extractor = nn.Sequential(*conv_layers)
+
+        if config.use_GAP:
+            # Add Global Average Pooling (GAP)
+            self.gap = nn.AdaptiveAvgPool2d((1, 1))
+            self._flat_features = prev_in_channel
+        else:
+            self.gap = None
+            # --- Compute flattened feature dimension via dummy forward pass ---
+            with torch.no_grad():
+                self.feature_extractor.eval()
+                dummy = torch.zeros(1, config.in_channels, self.input_height, self.input_width)
+                dummy_out = self.feature_extractor(dummy)
+                self._flat_features = dummy_out.numel()
+                self.feature_extractor.train()
+
+        # --- Build the classifier head ---
+        self.classifier_head = _construct_fc_layers(
+            start_layer_size=self._flat_features,
+            config=config,
+            num_outputs=num_outputs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.feature_extractor(x)
+
+        # If GAP is enabled, apply global average pooling and squeeze spatial dimensions;
+        # otherwise, flatten the feature maps into a 1D vector for the classifier head.
+        if self.gap is not None:
+            x = self.gap(x)                # (batch, channels, 1, 1)
+            x = x.squeeze(-1).squeeze(-1)  # (batch, channels)
+        else:
+            x = torch.flatten(x, start_dim=1)
+
+        x = self.classifier_head(x)
+        return x
+
+    def num_parameters(self) -> tuple[int, int]:
+        total_params = sum([p.numel() for p in self.parameters()])
+        trainable_params = sum([p.numel() for p in self.parameters() if p.requires_grad])
+        return total_params, trainable_params
+
+    def get_architecture_config(self) -> dict:
+        def _serialize_config() -> dict:
+            config_dict = asdict(self.config)  # still use asdict for everything else
+            config_dict['conv_blocks'] = [
+                {'block_type': 'residual', **asdict(b)} if isinstance(b, ResidualBlockConfig)
+                else {'block_type': 'conv', **asdict(b)}
+                for b in self.config.conv_blocks
+            ]
+            return config_dict
+
+        return {
+            'model_type': self.config.model_type,
+            'input_height': self.input_height,
+            'input_width': self.input_width,
+            'num_outputs': self.num_outputs,
+            'config': _serialize_config(),
+        }
+
+    def __str__(self) -> str:
+        """Returns a string representation of the model.
+
+        This provides a concise summary including input shape, number of input channels,
+        the convolutional blocks specification, classifier head architecture, and total parameters.
+
+        Returns:
+            str: Human-readable summary of model architecture and size.
+        """
+        # DONE: Finish me!
+        return (f"CNN_Model(input={self.input_height}x{self.input_width}, in_channels={self.config.in_channels}\n"
+                f"- blocks={self.config.conv_blocks}\n"
+                f"- head=[{self._flat_features} -> {self.config.hidden_units} -> {self.num_outputs}]\n"
+                f"- dropout={self.config.dropout}\n")
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
+class BagOfEmbeddings(nn.Module):
+    """Bag-of-Embeddings text classifier.
+
+    Architecture:
+        Embedding -> Masked Mean Pool -> Classifier Head
+
+    The embedding layer converts token indices to dense vectors. Mean pooling
+    averages the token embeddings over the sequence dimension, *excluding* padding
+    tokens, producing a fixed-size document vector regardless of sequence length.
+    The classifier head is a stack of Linear + ReLU + Dropout layers, reusing
+    the same motif as MLP_Model.
+
+    This is the NLP analog of Global Average Pooling (GAP) from CNN architectures:
+    GAP averages over spatial dimensions (H, W); mean pooling averages over the
+    sequence dimension L.
+
+    Args:
+        num_outputs (int): Number of output classes (e.g., 2 for binary sentiment).
+        config (ModelConfig): Hyperparameter configuration. Relevant fields:
+            vocab_size      -- number of rows in the embedding matrix
+            embedding_dim   -- width (D) of each embedding vector
+            padding_idx     -- token ID treated as padding (kept at zero vector)
+            freeze_embeddings -- if True, embedding weights are not updated
+            hidden_units    -- list of hidden layer sizes for the classifier head
+            dropout         -- list of dropout rates (one per hidden layer)
+    """
+
+    def __init__(self, num_outputs: int, config: ModelConfig):
+        super().__init__()
+        if config.model_type != "bow":
+            raise ValueError(f"Invalid model_type: {config.model_type}. Expected 'bow'.")
+
+        self.num_outputs = num_outputs
+        self.config = config
+
+        # --- Embedding layer ---
+        # DONE: Create self.embedding using nn.Embedding.
+        #       Pass config.vocab_size, config.embedding_dim, and config.padding_idx.
+        #       PyTorch will automatically keep the padding_idx row as a zero vector
+        #       and will not update it during backprop.
+        self.embedding = nn.Embedding(config.vocab_size, config.embedding_dim, padding_idx=config.padding_idx)
+
+        # DONE: If config.freeze_embeddings is True, prevent the embedding weights
+        #       from receiving gradient updates by setting requires_grad = False.
+        #       This is useful when you want to preserve pretrained GloVe knowledge
+        #       and only train the classifier head (see Challenge 1).
+        if config.freeze_embeddings:
+            self.embedding.requires_grad_(False)
+
+        # --- Classifier head: embedding_dim -> hidden_units -> num_outputs ---
+        self.classifier_head = _construct_fc_layers(
+            start_layer_size=config.embedding_dim,
+            config=config,
+            num_outputs=num_outputs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: LongTensor of token IDs, shape (batch_size, seq_len).
+
+        Returns:
+            Logit tensor of shape (batch_size, num_outputs).
+        """
+        # DONE: Step 1 — Look up embeddings for each token ID.
+        #       self.embedding(x) maps each integer ID to its D-dimensional vector.
+        #       Result shape: (batch_size, seq_len, embedding_dim)
+        embedded = self.embedding(x)
+
+        # DONE: Step 2 — Build the padding mask.
+        #       Create a float tensor that is 1.0 where x != padding_idx, 0.0 elsewhere.
+        #       Unsqueeze the last dimension so it broadcasts over embed_dim.
+        #       Shape after unsqueeze: (batch_size, seq_len, 1)
+        mask = torch.where(x != self.embedding.padding_idx, 1.0, 0).unsqueeze(-1)
+
+        # Step 3 — Masked mean pooling.
+        #       Multiply embeddings by the mask to zero out padding positions,
+        #       sum over the sequence dimension (dim=1), then divide by the count
+        #       of real tokens. Clamp the denominator to at least 1 to avoid
+        #       division-by-zero on hypothetical all-padding sequences.
+        summed = (embedded * mask).sum(dim=1)  # (batch, embed_dim)
+        lengths = mask.sum(dim=1).clamp(min=1)  # (batch, 1)
+        pooled = summed / lengths  # (batch, embed_dim)
+
+        # DONE: Step 4 — Pass the document vector through the classifier head.
+        return self.classifier_head(pooled)
+
+    def num_parameters(self) -> tuple[int, int]:
+        """Returns (total_params, trainable_params)."""
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return total, trainable
+
+    def get_architecture_config(self) -> dict:
+        """Returns a serializable dictionary describing the full model architecture."""
+        from dataclasses import asdict
+        return {
+            "model_class": "BagOfEmbeddings",
+            "num_outputs": self.num_outputs,
+            "config": asdict(self.config),
+        }
+
+    def __str__(self) -> str:
+        frozen = "frozen" if self.config.freeze_embeddings else "trainable"
+        return (
+            f"BagOfEmbeddings(vocab={self.config.vocab_size}, "
+            f"embed_dim={self.config.embedding_dim}, {frozen})\n"
+            f"  head=[{self.config.embedding_dim} -> "
+            f"{self.config.hidden_units} -> {self.num_outputs}]\n"
+            f"  dropout={self.config.dropout}"
+        )
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
+class TextCNN1D(nn.Module):
+    """1D CNN text classifier with multiple filter sizes.
+
+    Implements the Kim (2014) sentence classification architecture: parallel
+    Conv1d branches with different filter widths each perform max-over-time
+    pooling, and the resulting feature vectors are concatenated before a
+    single linear output layer.
+
+    Architecture:
+        Embedding -> [Conv1d(fs) -> ReLU -> MaxPool] for each fs
+                  -> Concatenate -> Classifier Head (Linear -> ReLU -> Dropout) x N -> Linear
+
+    Args:
+        num_outputs (int): Number of output classes (e.g., 2 for binary sentiment).
+        config (ModelConfig): Hyperparameter configuration. Relevant fields:
+            vocab_size        -- number of rows in the embedding matrix
+            embedding_dim     -- width (D) of each embedding vector
+            padding_idx       -- token ID treated as padding (zero vector, not updated)
+            freeze_embeddings -- if True, embedding weights are not updated during training
+            hidden_units      -- list of hidden layer sizes for the classifier head
+            dropout           -- list of dropout rates, one per hidden layer
+            TWO PARAMETERS SPECIFIC TO TextCNN1D
+            num_filters       -- Number of output channels for each Conv1d branch.
+            filter_sizes      -- (tuple[int, ...]): Kernel widths for each parallel branch.
+
+    Raises:
+        ValueError: If ``config.model_type`` is not ``'textcnn'``.
+
+    References:
+        Yoon Kim. "Convolutional Neural Networks for Sentence Classification."
+        EMNLP 2014. https://arxiv.org/abs/1408.5882
+    """
+    def __init__(self, num_outputs: int, config: ModelConfig):
+        """Initializes the TextCNN1D model, building embedding, conv, and output layers.
+
+        Args:
+            num_outputs (int): Number of output classes or regression targets.
+            config (ModelConfig): Model configuration; must have ``model_type == 'textcnn'``.
+
+        Raises:
+            ValueError: If ``config.model_type`` is not ``'textcnn'``.
+        """
+        super().__init__()
+
+        if config.model_type != "textcnn":
+            raise ValueError(f"Invalid model_type: {config.model_type}. Expected 'textcnn'.")
+
+        # Store hyperparameters so they can be retrieved later (e.g., get_architecture_config).
+        self.num_outputs = num_outputs
+        self.config = config
+
+        # DONE: Embedding table: maps each integer token ID to a dense vector of size embedding_dim.
+        # padding_idx ensures the <PAD> row stays at zero and receives no gradient updates.
+        self.embedding = nn.Embedding(config.vocab_size, config.embedding_dim, padding_idx=config.padding_idx)
+
+        # DONE: Provide the option to freeze pretrained embeddings (e.g., GloVe)
+        if config.freeze_embeddings:
+            self.embedding.requires_grad_(False)
+
+        # DONE: One Conv1d branch per filter size; each branch independently scans the sequence
+        # with a different n-gram width, capturing features at different granularities.
+        self.convs = nn.ModuleList([nn.Conv1d(in_channels=config.embedding_dim, out_channels=config.num_filters, kernel_size=size) for size in config.filter_sizes])
+
+        # DONE: Use your _construct_fc_layers to build the classifier head
+        self.classifier_head = _construct_fc_layers(config.num_filters*len(config.filter_sizes),config=config, num_outputs=num_outputs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Runs the forward pass.
+
+        Args:
+            x (torch.Tensor): LongTensor of token IDs, shape ``(batch_size, seq_len)``.
+
+        Returns:
+            torch.Tensor: Logit tensor of shape ``(batch_size, num_outputs)``.
+        """
+        # DONE: Look up a dense vector for every token ID in the sequence.
+        embedded = self.embedding(x)
+
+        # DONE: Conv1d expects (batch, channels, length), so permute embed_dim to the channel axis.
+        embedded = embedded.permute(0, 2, 1)
+
+        # Run each branch: convolve -> activate -> max-pool over the entire sequence length.
+        # Max-over-time pooling reduces variable-length feature maps to a single scalar per
+        # filter, making the representation independent of sequence length.
+        vectors = []
+        for conv in self.convs:
+            conv_embedded = conv(embedded)
+            conv_embedded = nn.ReLU()(conv_embedded)
+            vectors.append(torch.max(conv_embedded, dim=2).values)
+
+        # DONE: Concatenate the pooled vectors from all branches into one feature vector,
+        # then pass through the classifier head (dropout + linear layers).
+        vec_stack = torch.cat(vectors, dim=1)
+
+        return self.classifier_head(vec_stack)           # (batch, num_outputs)
+
+    def num_parameters(self) -> tuple[int, int]:
+        """Returns the total and trainable parameter counts.
+
+        Returns:
+            tuple[int, int]: ``(total_params, trainable_params)``.
+        """
+        # Count every parameter (frozen embeddings are included in total but not trainable).
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return total, trainable
+
+    def get_architecture_config(self) -> dict:
+        """Returns a serializable dictionary describing the full model architecture.
+
+        The returned dictionary contains all information needed to reconstruct
+        this model instance and is suitable for logging or checkpointing.
+
+        Returns:
+            dict: A dictionary with keys:
+                - ``'model_type'`` (str): Always ``'textcnn'``.
+                - ``'num_outputs'`` (int): Number of output classes.
+                - ``'config'`` (dict): Dataclass-serialized ``ModelConfig``.
+        """
+        from dataclasses import asdict
+        return {
+            "model_type": "textcnn",
+            "num_outputs": self.num_outputs,
+            "config": asdict(self.config),
+        }
+
+    def __str__(self) -> str:
+        """Returns a concise human-readable summary of the model architecture.
+
+        Returns:
+            str: Single-line description including vocab size, embedding dimension,
+                filter configuration, and number of outputs.
+        """
+        # Reflect the freeze status so it's visible at a glance when printing the model.
+        frozen = "frozen" if self.config.freeze_embeddings else "trainable"
+        return (
+            f"TextCNN1D(vocab={self.config.vocab_size}, embed_dim={self.config.embedding_dim} ({frozen}), "
+            f"num_filters={self.num_filters}, filter_sizes={self.filter_sizes}, "
+            f"num_outputs={self.num_outputs})"
+        )
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
+class RNNModel(nn.Module):
+    """Vanilla RNN (or LSTM or GRU) for regression or classification on continuous sequences.
+
+    This model processes sequence data (such as time series) using a recurrent neural network backbone (RNN, LSTM, or GRU),
+    followed by a fully connected classifier or regressor head. It does not perform embedding or tokenization and is assumed
+    to receive raw float inputs.
+
+    Architecture:
+        Input shape: (batch_size, seq_len, input_size)
+            └──> nn.RNN / nn.LSTM / nn.GRU → (batch_size, seq_len, num_directions * hidden_size)
+            └──> Final hidden state extraction → (batch_size, hidden_size * num_directions)
+            └──> Fully connected head → (batch_size, num_outputs)
+
+        Here ``num_directions`` is 1 for unidirectional and 2 for bidirectional RNNs (matching PyTorch).
+
+    Example:
+        >>> from src.my_engine.config import ModelConfig
+        >>> config = ModelConfig(
+        ...     model_type="rnn",
+        ...     rnn_hidden_size=32,
+        ...     rnn_num_layers=2,
+        ...     bidirectional=True,
+        ...     rnn_type="lstm",
+        ...     hidden_units=[16],
+        ...     dropout=[0.1]
+        ... )
+        >>> model = RNNModel(input_size=8, num_outputs=3, config=config)
+        >>> x = torch.randn(4, 22, 8)  # batch of 4, sequence length 22, 8 features
+        >>> y = model(x)  # (4, 3)
+
+    Attributes:
+        input_size (int): Number of input features per time step (e.g., 1 for univariate).
+        num_outputs (int): Number of output values (1 for regression, C for classification).
+        config (ModelConfig): Configuration object.
+        rnn (nn.Module): The RNN/LSTM/GRU module.
+        output_head (nn.Sequential): Sequential fully connected head after the recurrent backbone.
+    """
+
+    def __init__(self, input_size: int, num_outputs: int, config: ModelConfig) -> None:
+        """Build the recurrent backbone and output head.
+
+        Args:
+            input_size: Number of input features per time step (e.g., ``1`` for a
+                univariate series).
+            num_outputs: Number of outputs (``1`` for regression, ``C`` for
+                ``C``-way classification).
+            config: Model configuration. Uses ``rnn_hidden_size``,
+                ``rnn_num_layers``, ``bidirectional``, ``rnn_type`` (``"rnn"``,
+                ``"lstm"``, or ``"gru"``), and ``hidden_units`` / ``dropout`` for
+                the fully connected head built by ``_construct_fc_layers``.
+
+        Raises:
+            ValueError: If ``config.model_type`` is not ``"rnn"``.
+            ValueError: If ``config.rnn_type`` is not one of ``"rnn"``, ``"lstm"``, or ``"gru"``.
+
+        """
+        super().__init__()
+
+        # DONE: Validate config.model_type is "rnn". If not, throw a ValueError
+        if config.model_type.lower() != "rnn":
+            raise ValueError(f"Invalid model_type: {config.model_type.lower()} should be rnn")
+
+        # DONE: Store self copies of parameters
+        self.config = config
+        self.input_size = input_size
+        self.num_outputs = num_outputs
+
+        # DONE: Determine if bidirectional is set, so you know how many directions your RNN will have.
+        num_directions = 1
+        if config.bidirectional:
+            num_directions = 2
+
+        # Build the recurrent backbone. Choose the correct nn module depending on rnn_type.
+        # Throws a ValueError if not "rnn", "lstm" or "gru"
+        if config.rnn_type == "lstm":
+            rnn_module = nn.LSTM
+        elif config.rnn_type == "gru":
+            rnn_module = nn.GRU
+        elif config.rnn_type == "rnn":
+            rnn_module = nn.RNN
+        else:
+            raise ValueError(f"Invalid rnn_type: {config.rnn_type}. Supported: 'rnn', 'lstm', 'gru'.")
+
+        # DONE: Instantiate your recurrent module ("self.rnn") using the chosen rnn_module. Make sure
+        #       to use input_size, hidden_size, num_layers, batch_first, and bidirectional from config.
+        self.rnn = rnn_module(
+            input_size=input_size,
+            hidden_size=config.rnn_hidden_size,
+            num_layers=config.rnn_num_layers,
+            batch_first=True,
+            bidirectional=config.bidirectional,
+        )
+
+
+
+        # DONE: The output head receives the concatenated final hidden state(s).
+        #       Its input dimension is hidden_size * num_directions.
+        head_input_size = config.rnn_hidden_size * num_directions
+
+        # DONE: Call _construct_fc_layers to create a classifier/regressor head after the RNN
+        self.classifier_head = _construct_fc_layers(head_input_size, config, num_outputs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode each sequence and apply the output head.
+
+        For LSTM, only the last hidden state ``h_n`` is used (not the cell state).
+        For bidirectional models, the last forward and backward states of the top
+        layer are concatenated before the head.
+
+        Args:
+            x: Float tensor of shape ``(batch, seq_len, input_size)``.
+
+        Returns:
+            Float tensor of shape ``(batch, num_outputs)``.
+        """
+        # DONE: Run through the recurrent backbone (RNN, LSTM, or GRU)
+        hidden = self.rnn(x)
+
+        # Extract the last hidden state(s) depending on RNN type
+        if self.config.rnn_type == "lstm":
+            # LSTM returns a tuple (h_n, c_n)
+            _, (h_n,_) = hidden
+        else:
+            # GRU and vanilla RNN return h_n directly
+            _, h_n = hidden
+
+        # DONE: h_n shape: (num_layers * num_directions, batch, hidden_size)
+        if self.config.bidirectional:
+            # Forward final state: h_n[-2], Backward final state: h_n[-1]
+            # Both have shape (batch, hidden_size), so we cat along dim=1
+            x = torch.cat((h_n[-2], h_n[-1]), dim=1)
+        else:
+            # Use the last layer's final hidden state (shape: batch, hidden_size)
+            x = h_n[-1]
+        # DONE: Pass through classifier head
+
+        output = self.classifier_head(x)
+
+        return output
+
+    def num_parameters(self) -> tuple[int, int]:
+        """Count total and trainable parameters in this module and submodules.
+
+        Returns:
+            A tuple ``(total_params, trainable_params)`` where both counts are
+            non-negative integers.
+        """
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return total, trainable
+
+    def get_architecture_config(self) -> dict:
+        """Return a JSON-serializable description of the architecture.
+
+        Returns:
+            A dictionary with keys:
+
+            * ``model_class``: The string ``"RNNModel"``.
+            * ``input_size``: Features per time step.
+            * ``num_outputs``: Size of the head output.
+            * ``config``: The full ``ModelConfig`` as a plain dict (via
+              ``dataclasses.asdict``).
+        """
+        return {
+            "model_class": "RNNModel",
+            "input_size": self.input_size,
+            "num_outputs": self.num_outputs,
+            "config": asdict(self.config),
+        }
+
+    def __str__(self) -> str:
+        """Return a short, human-readable summary of hyperparameters.
+
+        Returns:
+            A string listing ``rnn_type``, directionality (uni/bi), ``input_size``,
+            ``rnn_hidden_size``, ``rnn_num_layers``, and ``num_outputs``.
+        """
+        direction = "bi" if self.config.bidirectional else "uni"
+        return (
+            f"RNNModel(type={self.config.rnn_type}, {direction}, "
+            f"input={self.input_size}, hidden={self.config.rnn_hidden_size}, "
+            f"layers={self.config.rnn_num_layers}, out={self.num_outputs})"
+        )
+
+    def __repr__(self) -> str:
+        """Return the same string as :meth:`__str__` for notebook and debugger display.
+
+        Returns:
+            Identical to :meth:`__str__`.
+        """
+        return self.__str__()
+
+
+class TextRNNModel(nn.Module):
+    """RNN text classifier using an embedding layer and RNN backbone.
+
+    This model maps input token ID sequences to embeddings, processes them with an RNN or LSTM,
+    and classifies the resulting sequence representations. Handles variable-length padded sequences
+    by extracting the hidden state at the last non-padded token for each example in the batch.
+
+    Architecture:
+        Token IDs -> Embedding -> RNN -> Final Hidden State -> Classifier Head
+
+    Handles padded sequences by extracting the hidden state at the actual
+    (non-padded) last time step for each sequence in the batch.
+
+    Args:
+        num_outputs (int): Number of output classes.
+        config (ModelConfig): Configuration object containing model hyperparameters, including:
+            - vocab_size (int): Vocabulary size for the embedding layer.
+            - embedding_dim (int): Dimensionality of the embedding vectors.
+            - padding_idx (int): Token index used for padding.
+            - freeze_embeddings (bool): If True, the embedding weights are not updated during training.
+            - rnn_hidden_size (int): Hidden size of the RNN/LSTM.
+            - rnn_num_layers (int): Number of stacked RNN/LSTM layers.
+            - bidirectional (bool): If True, use a bidirectional RNN/LSTM.
+            - rnn_type (str): Type of RNN backbone ("rnn", "lstm", or "gru").
+            - hidden_units (list[int] or None): MLP head hidden layer sizes.
+            - dropout (list[float]): Dropout rates for the classifier head layers.
+    """
+
+    def __init__(self, num_outputs: int, config: ModelConfig):
+        super().__init__()
+
+        if config.model_type != "text_rnn":
+            raise ValueError(f"Invalid model_type: {config.model_type}. Expected 'text_rnn'.")
+
+        self.num_outputs = num_outputs
+        self.config = config
+
+        # DONE: Set up embedding layer (same as BoE), and freeze the embeddings if requested.
+        self.embedding = nn.Embedding(config.vocab_size, config.embedding_dim, padding_idx=self.config.padding_idx)
+
+
+        # DONE: Determine if bidirectional is set, so you know how many directions your RNN will have.
+        self.num_directions = 2 if config.bidirectional else 1
+
+
+        # DONE: Build the recurrent backbone. Choose the correct nn module depending on rnn_type. NOTE:
+        #       This is the same as the RNNModel class, but using the embedding_dim for the input_size.
+        # Throws a ValueError if not "rnn", "lstm" or "gru"
+        if config.rnn_type == "lstm":
+            rnn_module = nn.LSTM
+        elif config.rnn_type == "gru":
+            rnn_module = nn.GRU
+        elif config.rnn_type == "rnn":
+            rnn_module = nn.RNN
+        else:
+            raise ValueError(f"Invalid rnn_type: {config.rnn_type}. Supported: 'rnn', 'lstm', 'gru'.")
+
+        # DONE: Instantiate your recurrent module ("self.rnn")
+        self.rnn = rnn_module(
+            input_size=config.embedding_dim,
+            hidden_size=config.rnn_hidden_size,
+            num_layers=config.rnn_num_layers,
+            bidirectional=config.bidirectional,
+            batch_first=True
+        )
+
+        # DONE: The output head receives the concatenated final hidden state(s).
+        #       Its input dimension is hidden_size * num_directions.
+        self._flatten_size = self.config.rnn_hidden_size * self.num_directions
+
+        # DONE: Call _construct_fc_layers to create a classifier/regressor head after the RNN
+        self.classifier_head = _construct_fc_layers(
+            self._flatten_size,
+            config=self.config,
+            num_outputs=num_outputs,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: LongTensor of token IDs, shape (batch, seq_len).
+
+        Returns:
+            Logit tensor of shape (batch, num_outputs).
+        """
+        # DONE: Compute the actual (non-padding) length of each sequence.
+        #       Compare x against padding_idx and sum along the sequence dimension.
+        #       Result shape: (batch,)
+        lengths = (x != self.config.padding_idx).sum(dim=-1).long()
+        # DONE: Look up embeddings for each token ID.
+        #       Result shape: (batch, seq_len, embedding_dim)
+        x = self.embedding(x)
+        # DONE: Run the embedded sequence through the RNN backbone.
+        #       rnn_out contains every time step's hidden state for the top layer.
+        #       rnn_out shape: (batch, seq_len, hidden_size * num_directions)
+        hidden = self.rnn(x)
+        # Extract the last hidden state(s) depending on RNN type
+        if self.config.rnn_type == "lstm":
+            # LSTM returns a tuple (h_n, c_n)
+            h_n, _ = hidden
+        else:
+            # GRU and vanilla RNN return h_n directly
+            h_n, _ = hidden
+
+        # DONE: Build index tensors to select the last real token's hidden state
+        #       for each example in the batch.
+        #       last_idx: subtract 1 from each length; clamp to 0 to guard against
+        #       any empty sequence. Shape: (batch,)
+        #       batch_idx: just [0, 1, 2, ..., batch_size-1] for fancy indexing.
+        last_idx = torch.clamp(lengths - 1, min=0)
+        batch_idx = torch.arange(x.shape[0], dtype=torch.long, device=x.device)
+
+
+        # DONE: Extract the final hidden state, handling bidirectionality.
+        #       For unidirectional models, index rnn_out at last_idx for each example.
+        #       For bidirectional models, the two directions finish at DIFFERENT positions:
+        #         - Forward direction  → final state is at last_idx (last real token)
+        #         - Backward direction → final state is at position 0 (the backward RNN
+        #           reads right-to-left, so it finishes at the first token)
+        #       Slice rnn_out along the hidden-state axis (first half = forward,
+        #       second half = backward) and torch.cat them together.
+        if self.config.bidirectional:
+           first = h_n[batch_idx, last_idx, :self.config.rnn_hidden_size]
+           last = h_n[batch_idx, 0, self.config.rnn_hidden_size:]
+           out = torch.concat([first, last], dim=-1)
+        else:
+            out = h_n[batch_idx, last_idx]
+
+
+        # DONE: Pass the final hidden state through the classifier head.
+        return self.classifier_head(out)
+
+    def num_parameters(self) -> tuple[int, int]:
+            """Count total and trainable parameters in this module and submodules.
+
+            Returns:
+                A tuple ``(total_params, trainable_params)`` where both counts are
+                non-negative integers.
+            """
+            total = sum(p.numel() for p in self.parameters())
+            trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+            return total, trainable
+
+    def get_architecture_config(self) -> dict:
+        """Return a JSON-serializable description of the architecture.
+
+        Returns:
+            A dictionary with keys:
+
+            * ``model_class``: The string ``"TextRNNModel"``.
+            * ``num_outputs``: Size of the head output.
+            * ``config``: The full ``ModelConfig`` as a plain dict (via
+              ``dataclasses.asdict``).
+        """
+        from dataclasses import asdict
+        return {
+            "model_class": "TextRNNModel",
+            "num_outputs": self.num_outputs,
+            "config": asdict(self.config),
+        }
+
+    def __str__(self) -> str:
+        """Return a short, human-readable summary of hyperparameters.
+
+        Returns:
+            A string listing ``rnn_type``, directionality (uni/bi), ``vocab_size``,
+            ``embedding_dim``, ``rnn_hidden_size``, ``rnn_num_layers``, and ``num_outputs``.
+        """
+        frozen = "frozen" if self.config.freeze_embeddings else "trainable"
+        direction = "bi" if self.config.bidirectional else "uni"
+        return (
+            f"TextRNNModel(type={self.config.rnn_type}, {direction}, "
+            f"vocab={self.config.vocab_size}, embed={self.config.embedding_dim} ({frozen}), "
+            f"hidden={self.config.rnn_hidden_size}, layers={self.config.rnn_num_layers}, "
+            f"out={self.num_outputs})"
+        )
+
+    def __repr__(self) -> str:
+        """Return the same string as :meth:`__str__` for notebook and debugger display.
+
+        Returns:
+            Identical to :meth:`__str__`.
+        """
+        return self.__str__()
+
+
+class AttentionClassifier(nn.Module):
+    """Self-attention text classifier using nn.MultiheadAttention.
+
+    Architecture:
+        Token IDs -> Embedding -> MultiheadAttention (self-attention) ->
+        Masked Mean Pool -> Classifier Head
+
+    The model applies self-attention over the embedded token sequence, then
+    performs masked mean pooling (excluding padding tokens) to produce a
+    fixed-size document vector, which is passed through a fully connected
+    classifier head.
+
+    Args:
+        num_outputs (int): Number of output classes.
+        config (ModelConfig): Configuration containing:
+            vocab_size (int): Vocabulary size for the embedding layer.
+            embedding_dim (int): Dimensionality of each embedding vector.
+                Must satisfy embedding_dim % num_heads == 0.
+            padding_idx (int): Token index treated as padding.
+            freeze_embeddings (bool): If True, embedding weights are frozen.
+            num_heads (int): Number of attention heads.
+            dropout (list[float]): Dropout rates for the classifier head.
+            hidden_units (list[int]): Hidden layer sizes for the classifier head.
+    """
+
+    def __init__(self, num_outputs: int, config: ModelConfig):
+        super().__init__()
+
+        # DONE: Validate that config.model_type is "text_attn"
+        # Raise ValueError if it's not
+        if config.model_type != "text_attn":
+            raise ValueError(
+                f"Invalid model_type: {config.model_type}. Expected 'text_attn'."
+            )
+
+        # DONE: Validate that embedding_dim is divisible by num_heads
+        # This is required by nn.MultiheadAttention
+        # Raise ValueError if the constraint is violated
+        if config.embedding_dim % config.num_heads != 0:
+            raise ValueError(f"num_heads must divide embedding_dim")
+
+        # Store num_outputs and config as instance attributes
+        self.num_outputs = num_outputs
+        self.config = config
+
+        # ── Embedding layer ──
+        # DONE: Create the embedding layer
+        # Use nn.Embedding with vocab_size, embedding_dim, and padding_idx from config
+        self.embedding = nn.Embedding(config.vocab_size, config.embedding_dim, padding_idx=config.padding_idx)
+
+        # If config.freeze_embeddings is True, freeze the embedding weights
+        if config.freeze_embeddings:
+            self.embedding.weight.requires_grad = False
+
+        # ── Self-attention layer ──
+        # DONE: Create the self-attention layer using nn.MultiheadAttention
+        # - embed_dim should be config.embedding_dim
+        # - num_heads should be config.num_heads
+        # - batch_first should be True (so input/output shape is (batch, seq_len, embed_dim))
+        # - dropout should be config.dropout[0] if available, else 0.0
+        self.attention = nn.MultiheadAttention(
+            embed_dim=config.embedding_dim,
+            num_heads=config.num_heads,
+            batch_first=True,
+            dropout= config.dropout[0] if config.dropout else 0.0,
+        )
+
+        # ── Classifier head: embedding_dim -> hidden_units -> num_outputs ──
+        # DONE: Create the classifier head using _construct_fc_layers
+        # - start_layer_size should be config.embedding_dim (output of pooling)
+        # - Pass config and num_outputs
+        self.classifier_head = _construct_fc_layers(config.embedding_dim, config, num_outputs)
+
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: LongTensor of token IDs, shape (batch, seq_len).
+
+        Returns:
+            Logit tensor of shape (batch, num_outputs).
+        """
+        # DONE: ── Step 1: Build the padding mask ──
+        # True where x IS padding (PyTorch convention: True = ignore)
+        padding_mask = torch.where(x != self.config.padding_idx, False, True)
+
+        # DONE: ── Step 2: Embed tokens ──
+        embedded = self.embedding(x)
+
+        # DONE: ── Step 3: Self-attention ──
+        # For self-attention, query = key = value = embedded
+        # key_padding_mask tells attention to ignore padding positions
+        attn_out, _ = self.attention(
+            embedded,
+            embedded,
+            embedded,
+            key_padding_mask=padding_mask,
+        )  # attn_out: (batch, seq_len, embed_dim)
+
+        # DONE: ── Step 4: Masked mean pooling (exclude padding) ──
+        # Zero out padding positions so they don't contribute to the sum
+        attn_out = attn_out * ~padding_mask.unsqueeze(-1)
+
+        # Count real (non-padding) tokens per sequence
+        lengths = (~padding_mask).sum(dim=1, keepdim=True).float()  # (batch, 1)
+        lengths = lengths.clamp(min=1)  # avoid division by zero
+
+        # Sum over sequence dim and divide by real token count
+        pooled = attn_out.sum(dim=1) / lengths  # (batch, embed_dim)
+
+        # DONE: ── Step 5: Classifier head ──
+        return self.classifier_head(pooled)
+
+    def num_parameters(self) -> tuple:
+        """Return (total_params, trainable_params)."""
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return total, trainable
+
+
+class PositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding for transformer models.
+
+    Adds position-dependent sinusoidal signals to the input embeddings so that
+    the transformer can distinguish token positions despite self-attention being
+    permutation-invariant. Uses the formulation from Vaswani et al. (2017):
+        PE(pos, 2i)   = sin(pos / 10000^(2i/d_model))
+        PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+
+    The PE matrix is precomputed for positions 0..max_len-1 and registered as a
+    buffer (not a parameter) so it moves with the model to GPU but is not updated
+    by the optimizer.
+
+    Args:
+        d_model (int): Embedding / model dimension.
+        max_len (int): Maximum sequence length to precompute encodings for.
+        dropout (float): Dropout probability applied after adding PE.
+    """
+
+    def __init__(self, d_model: int, max_len: int = 5000, dropout: float = 0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        # ── Precompute the sinusoidal PE matrix ──
+        pe = torch.zeros(max_len, d_model)              # (max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1).float()  # (max_len, 1)
+
+        # DONE: Compute the division term: 10000^(2i/d_model) via log-space for numerical stability
+        div_term = torch.exp(2*torch.tensor([x for x in range(int(d_model/2))])/d_model * -math.log(10000))           # (d_model/2,)
+
+        # DONE: Even indices: sin; odd indices: cos; (1, max_len, d_model) for broadcasting
+        pe[:, 0::2] = torch.sin(pe[:, 0::2]/div_term)                       # even indices: sin
+        pe[:, 1::2] = torch.cos(pe[:, 1::2]/div_term)                       # odd indices: cos
+        pe = pe.unsqueeze(0)                    # (1, max_len, d_model) for broadcasting
+
+        # Register as buffer — moves with .to(device) but is not a trainable parameter
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Add positional encoding to the input embeddings.
+
+        Args:
+            x: Tensor of shape (batch, seq_len, d_model).
+
+        Returns:
+            Tensor of same shape with positional encoding added and dropout applied.
+        """
+        x = x + self.pe[:, :x.size(1), :]               # slice PE to match actual seq_len
+        return self.dropout(x)
+
+
+class TransformerClassifier(nn.Module):
+    """Transformer encoder text classifier using PyTorch's built-in modules.
+
+    Architecture:
+        Token IDs -> Embedding (* sqrt(d_model)) -> PositionalEncoding ->
+        TransformerEncoder (N layers) -> Masked Mean Pool -> Classifier Head
+
+    Each TransformerEncoderLayer contains self-attention + FFN + residual + LayerNorm.
+    The model uses Pre-LN ordering (norm_first=True) for training stability.
+
+    Args:
+        num_outputs (int): Number of output classes.
+        config (ModelConfig): Configuration containing:
+            model_type (str): Must be "text_transformer".
+            vocab_size (int): Vocabulary size for the embedding layer.
+            embedding_dim (int): Model dimension (d_model). Must be divisible by num_heads.
+            padding_idx (int): Token index treated as padding.
+            freeze_embeddings (bool): If True, embedding weights are frozen.
+            num_heads (int): Number of attention heads per encoder layer.
+            num_encoder_layers (int): Number of stacked encoder layers (N).
+            dim_feedforward (int): Hidden dimension of the FFN sublayer.
+            dropout (list[float]): Dropout rates for the classifier head.
+            hidden_units (list[int]): Hidden layer sizes for the classifier head.
+    """
+
+    def __init__(self, num_outputs: int, config: ModelConfig):
+        super().__init__()
+
+        if config.model_type != "text_transformer":
+            raise ValueError(
+                f"Invalid model_type: {config.model_type}. Expected 'text_transformer'."
+            )
+
+        # Confirm compatability of embedding dimension and number of heads
+        if config.embedding_dim % config.num_heads != 0:
+            raise ValueError(
+                f"embedding_dim ({config.embedding_dim}) must be divisible by "
+                f"num_heads ({config.num_heads})."
+            )
+
+        self.num_outputs = num_outputs
+        self.config = config
+        self.d_model = config.embedding_dim
+
+        # DONE: ── Embedding layer ──
+        self.embedding = nn.Embedding(config.vocab_size, config.embedding_dim, config.padding_idx) # and don't forget the freeze_embeddings option
+
+        # If config.freeze_embeddings is True, freeze the embedding weights
+        if config.freeze_embeddings:
+            self.embedding.weight.requires_grad = False
+        # DONE: ── Positional encoding ──
+        self.pos_encoder = PositionalEncoding(config.embedding_dim)
+
+        # DONE: ── Transformer encoder stack ──
+        encoder_layer = nn.TransformerEncoderLayer(
+            config.embedding_dim, config.num_heads, config.dim_feedforward, batch_first=True
+        )
+
+        # DONE: -- TransformerEncoder --
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, config.num_encoder_layers
+        )
+
+        # DONE: ── Classifier head ──
+        self.classifier_head = _construct_fc_layers(config.embedding_dim, config, num_outputs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: LongTensor of token IDs, shape (batch, seq_len).
+
+        Returns:
+            Logit tensor of shape (batch, num_outputs).
+        """
+        # ── Build padding mask ──
+        # PyTorch convention: True = ignore this position
+        padding_mask = (x == self.config.padding_idx)   # (batch, seq_len)
+
+        # DONE: ── Embed + scale + positional encoding ──
+        embedded = self.pos_encoder(self.embedding(x))
+
+        # DONE: ── Transformer encoder ──
+        # src_key_padding_mask has identical semantics to key_padding_mask from Week 11
+        encoder_out = self.transformer_encoder(embedded, src_key_padding_mask=padding_mask)
+
+        # ── Masked mean pooling ──
+        encoder_out = encoder_out.masked_fill(
+            padding_mask.unsqueeze(-1), 0.0
+        )
+        lengths = (~padding_mask).sum(dim=1, keepdim=True).float().clamp(min=1)
+        pooled = encoder_out.sum(dim=1) / lengths        # (batch, d_model)
+
+        # DONE: ── Classifier head ──
+        return self.classifier_head(pooled)
+
+    def num_parameters(self) -> tuple:
+        """Return (total_params, trainable_params)."""
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return total, trainable
+
+    def get_architecture_config(self) -> dict:
+        """Return a JSON-serializable description of the architecture."""
+        from dataclasses import asdict
+        return {
+            "model_class": "TransformerClassifier",
+            "num_outputs": self.num_outputs,
+            "config": asdict(self.config),
+        }
+
+    def __str__(self) -> str:
+        frozen = "frozen" if self.config.freeze_embeddings else "trainable"
+        return (
+            f"TransformerClassifier(vocab={self.config.vocab_size}, "
+            f"d_model={self.config.embedding_dim} ({frozen}), "
+            f"heads={self.config.num_heads}, layers={self.config.num_encoder_layers}, "
+            f"d_ff={self.config.dim_feedforward}, out={self.num_outputs})"
+        )
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
+class AttentiveStatsPooling(nn.Module):
+    """
+    Attentive statistics pooling for speaker recognition.
+
+    Computes a weighted mean and weighted standard deviation over time.
+    """
+
+    def __init__(self, d_model: int, hidden_dim: int = 128):
+        super().__init__()
+
+        self.attention = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Pool frame-level features into an utterance-level speaker representation.
+
+        Args:
+            x: Tensor of shape [batch_size, time_steps, d_model].
+
+        Returns:
+            Tensor of shape [batch_size, 2 * d_model].
+        """
+        weights = self.attention(x)              # [B, T, 1]
+        weights = torch.softmax(weights, dim=1)  # [B, T, 1]
+
+        mean = torch.sum(weights * x, dim=1)     # [B, D]
+
+        variance = torch.sum(weights * (x - mean.unsqueeze(1)) ** 2, dim=1)
+        std = torch.sqrt(variance.clamp(min=1e-5))
+
+        return torch.cat([mean, std], dim=1)     # [B, 2D]
+
+
+class SpeakerTransformer(nn.Module):
+    """
+    CNN + Transformer speaker identification model.
+
+    Expected input:
+        log-Mel spectrograms with shape [batch_size, n_mels, time_steps].
+    """
+
+    def __init__(self, num_outputs: int, config: ModelConfig):
+        super().__init__()
+        self.num_outputs = num_outputs
+        self.config = config
+
+        n_mels = config.n_mels
+        d_model = config.embedding_dim  # Using embedding_dim as d_model for the transformer
+        n_heads = config.num_heads
+        num_layers = config.num_encoder_layers
+        dim_feedforward = config.dim_feedforward
+        embedding_dim = config.embedding_dim
+        dropout = config.dropout[0] if isinstance(config.dropout, list) else config.dropout
+
+        self.conv_frontend = nn.Sequential(
+            nn.Conv1d(n_mels, 128, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+
+            nn.Conv1d(128, 256, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(256),
+            nn.GELU(),
+
+            nn.Conv1d(256, d_model, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+        )
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+        )
+
+        self.pooling = AttentiveStatsPooling(d_model=d_model)
+
+        self.embedding_head = nn.Sequential(
+            nn.Linear(2 * d_model, embedding_dim),
+            nn.BatchNorm1d(embedding_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+        self.classifier = nn.Linear(embedding_dim, num_outputs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Run a batch of log-Mel spectrograms through the model.
+
+        Args:
+            x: Tensor of shape [batch_size, n_mels, time_steps].
+
+        Returns:
+            Logits with shape [batch_size, num_outputs].
+        """
+        x = self.conv_frontend(x)        # [B, D, T']
+        x = x.transpose(1, 2)            # [B, T', D]
+
+        x = self.transformer(x)          # [B, T', D]
+
+        x = self.pooling(x)              # [B, 2D]
+        embedding = self.embedding_head(x)
+
+        logits = self.classifier(embedding)
+
+        return logits
+
+    def extract_embedding(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Extract speaker embeddings for verification or database matching.
+
+        Args:
+            x: Tensor of shape [batch_size, n_mels, time_steps].
+
+        Returns:
+            Speaker embedding tensor with shape [batch_size, embedding_dim].
+        """
+        self.eval()
+
+        with torch.no_grad():
+            x = self.conv_frontend(x)
+            x = x.transpose(1, 2)
+            x = self.transformer(x)
+            x = self.pooling(x)
+            embedding = self.embedding_head(x)
+
+        return F.normalize(embedding, dim=1)
+
+    def num_parameters(self) -> int:
+        """Return the total number of trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def get_architecture_config(self) -> dict:
+        """Return a dictionary describing the model architecture for checkpointing."""
+        return {
+            "model_class": self.__class__.__name__,
+            "model_type": self.config.model_type,
+            "num_outputs": self.num_outputs,
+            "config": asdict(self.config),
+        }
+
+    def __str__(self) -> str:
+        return (
+            f"SpeakerTransformer(\n"
+            f"  n_mels={self.config.n_mels},\n"
+            f"  embedding_dim={self.config.embedding_dim},\n"
+            f"  num_heads={self.config.num_heads},\n"
+            f"  num_layers={self.config.num_encoder_layers},\n"
+            f"  dim_feedforward={self.config.dim_feedforward},\n"
+            f"  num_outputs={self.num_outputs}\n"
+            f")"
+        )
+
+    def __repr__(self) -> str:
+        return self.__str__()
