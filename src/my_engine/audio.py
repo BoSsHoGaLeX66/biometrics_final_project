@@ -94,6 +94,11 @@ def create_audio_datasets(path_dir, sr, num_speakers, train_pct=0.8, val_pct=0.1
     X = X.permute(0, 2, 1)
     y = torch.tensor(y, dtype=torch.long)
 
+    shuffle_idx = torch.randperm(X.size(0))
+
+    X = X[shuffle_idx]
+    y = y[shuffle_idx]
+
     unique_ids = torch.unique(y)
 
     id_map = {id.item(): i for i, id in enumerate(unique_ids)}
