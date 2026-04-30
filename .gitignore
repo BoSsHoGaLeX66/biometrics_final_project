@@ -85,3 +85,5 @@ checkpoints/
 .env
 .env.*
 !.env.example
+
+.codex

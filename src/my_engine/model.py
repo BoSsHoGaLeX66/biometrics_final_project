@@ -1233,6 +1233,34 @@ class AttentiveStatsPooling(nn.Module):
         return torch.cat([mean, std], dim=1)     # [B, 2D]
 
 
+class LearnedPositionalEncoding(nn.Module):
+    """
+    Learned positional encoding for speaker transformer frame embeddings.
+
+    Args:
+        d_model: Feature dimension of each time-step embedding.
+        max_len: Maximum supported sequence length after the convolutional frontend.
+    """
+
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        self.embedding = nn.Embedding(max_len, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Add learned positional embeddings to a batch of sequence embeddings.
+
+        Args:
+            x: Tensor of shape [batch_size, time_steps, d_model].
+
+        Returns:
+            Tensor of shape [batch_size, time_steps, d_model].
+        """
+        length = x.size(1)
+        x_idxs = torch.arange(length, device=x.device)
+        return x + self.embedding(x_idxs)
+
+
 class SpeakerTransformer(nn.Module):
     """
     CNN + Transformer speaker identification model.
@@ -1283,6 +1311,12 @@ class SpeakerTransformer(nn.Module):
             num_layers=num_layers,
         )
 
+        max_len = config.max_seq_len if config.max_seq_len is not None else 5000
+        self.positional_encoding = LearnedPositionalEncoding(
+            d_model=d_model,
+            max_len=max_len,
+        )
+
         self.pooling = AttentiveStatsPooling(d_model=d_model)
 
         self.embedding_head = nn.Sequential(
@@ -1306,6 +1340,7 @@ class SpeakerTransformer(nn.Module):
         """
         x = self.conv_frontend(x)        # [B, D, T']
         x = x.transpose(1, 2)            # [B, T', D]
+        x = self.positional_encoding(x)  # [B, T', D]
 
         x = self.transformer(x)          # [B, T', D]
 
@@ -1331,6 +1366,7 @@ class SpeakerTransformer(nn.Module):
         with torch.no_grad():
             x = self.conv_frontend(x)
             x = x.transpose(1, 2)
+            x = self.positional_encoding(x)
             x = self.transformer(x)
             x = self.pooling(x)
             embedding = self.embedding_head(x)
