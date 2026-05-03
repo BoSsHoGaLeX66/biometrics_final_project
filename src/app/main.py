@@ -14,16 +14,17 @@ if os.getcwd() != PROJECT_PATH:
 
 import numpy as np
 import torch
-import torchaudio
 
+from src.app.identify import identify, set_database_path, set_model_type
 from src.app.inference import get_features
 from src.app.load import load_model
+from src.app.utils import audio_chunk_to_tensor
 
 
 DEFAULT_SAMPLE_RATE = 44100
 DESIRED_SAMPLE_RATE = 16000
 DEFAULT_BLOCK_SECONDS = 4
-DEFAULT_DATABASE_PATH = "data/speaker_embeddings.sqlite3"
+DEFAULT_DATABASE_PATH = "data/speaker_embeddings.db"
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,27 +99,6 @@ def make_audio_callback(audio_queue: queue.Queue[np.ndarray]) -> Any:
     return callback
 
 
-def audio_chunk_to_tensor(chunk: np.ndarray, sample_rate: int, device: torch.device) -> torch.Tensor:
-    """
-    Convert a queued microphone chunk into a 16 kHz mono float tensor for inference.
-
-    Args:
-        chunk: Audio chunk from sounddevice with shape [frames] or [frames, channels].
-        sample_rate: Sampling rate of the captured audio chunk.
-        device: Torch device that should receive the inference tensor.
-
-    Returns:
-        Float tensor shaped [num_samples] at 16 kHz on the requested device.
-    """
-    tensor = torch.as_tensor(chunk, dtype=torch.float32, device=device)
-    if tensor.dim() == 2:
-        tensor = tensor.mean(dim=1)
-    if sample_rate != DESIRED_SAMPLE_RATE:
-        resampler = torchaudio.transforms.Resample(sample_rate, DESIRED_SAMPLE_RATE).to(device)
-        tensor = resampler(tensor)
-    return tensor.contiguous()
-
-
 def run_inference_loop(args: argparse.Namespace) -> None:
     """
     Capture microphone audio continuously and run embedding extraction on each queued chunk.
@@ -130,6 +110,8 @@ def run_inference_loop(args: argparse.Namespace) -> None:
 
     device = torch.device(args.device)
     model = load_model(args.model_type, device=device)
+    set_database_path(args.database_path)
+    set_model_type(args.model_type)
     audio_queue: queue.Queue[np.ndarray] = queue.Queue()
     sample_rate = DEFAULT_SAMPLE_RATE
     blocksize = sample_rate * args.block_seconds
@@ -149,6 +131,7 @@ def run_inference_loop(args: argparse.Namespace) -> None:
             inference_tensor = audio_chunk_to_tensor(chunk, sample_rate, device=device)
             features = get_features(model, args.model_type, inference_tensor, sample_rate=DESIRED_SAMPLE_RATE)
             print(f"Extracted features with shape {tuple(features.shape)}")
+            identify(features)
 
 
 def main() -> None:

@@ -9,12 +9,12 @@ from typing import Any
 
 import numpy as np
 import torch
-import torchaudio
 from torch import nn
 
 from src.app.database import connect_database, initialize_database, insert_user_embedding
 from src.app.inference import ModelType, get_features
 from src.app.load import load_model
+from src.app.utils import audio_chunk_to_tensor
 
 
 DEFAULT_SAMPLE_RATE = 44100
@@ -171,27 +171,6 @@ def record_audio_clip(sample_rate: int, clip_seconds: int) -> np.ndarray:
         audio_chunk = audio_queue.get()
     print("Recording finished.")
     return audio_chunk
-
-
-def audio_chunk_to_tensor(chunk: np.ndarray, sample_rate: int, device: torch.device) -> torch.Tensor:
-    """
-    Convert a recorded enrollment clip into a 16 kHz mono float tensor.
-
-    Args:
-        chunk: Audio chunk from sounddevice with shape [frames] or [frames, channels].
-        sample_rate: Sampling rate of the captured audio chunk.
-        device: Torch device that should receive the inference tensor.
-
-    Returns:
-        Float tensor shaped [num_samples] at 16 kHz on the requested device.
-    """
-    tensor = torch.as_tensor(chunk, dtype=torch.float32, device=device)
-    if tensor.dim() == 2:
-        tensor = tensor.mean(dim=1)
-    if sample_rate != DESIRED_SAMPLE_RATE:
-        resampler = torchaudio.transforms.Resample(sample_rate, DESIRED_SAMPLE_RATE).to(device)
-        tensor = resampler(tensor)
-    return tensor.contiguous()
 
 
 def extract_enrollment_embedding(

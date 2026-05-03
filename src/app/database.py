@@ -1,7 +1,10 @@
 import sqlite3
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+
+import numpy as np
 
 
 ModelType = Literal["homegrown", "finetuned"]
@@ -35,6 +38,26 @@ CREATE TABLE user_embeddings (
 EMBEDDING_DIM = 256
 
 
+@dataclass(frozen=True)
+class StoredUserEmbedding:
+    """
+    Stored speaker embedding with the user metadata needed for identification.
+
+    Attributes:
+        user_id: Primary key of the registered user.
+        name: Registered user name.
+        target: Whether the registered user is marked as a target.
+        user_embedding_id: Primary key of the user_embeddings row.
+        embedding: Speaker embedding values read from the vector database.
+    """
+
+    user_id: int
+    name: str
+    target: bool
+    user_embedding_id: int
+    embedding: tuple[float, ...]
+
+
 def _get_sqlite_vec():
     """
     Import sqlite-vec when vector database functionality is used.
@@ -64,7 +87,9 @@ def connect_database(database_path: str | Path) -> sqlite3.Connection:
     """
     connection = sqlite3.connect(database_path)
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.enable_load_extension(True)
     _get_sqlite_vec().load(connection)
+    connection.enable_load_extension(False)
     return connection
 
 
@@ -174,6 +199,53 @@ def insert_user_embedding(
         return int(link_cursor.lastrowid)
 
 
+def get_all_user_embeddings(connection: sqlite3.Connection, model_type: ModelType) -> list[StoredUserEmbedding]:
+    """
+    Retrieve stored user embeddings for one model and their associated user metadata.
+
+    Args:
+        connection: SQLite database connection with sqlite-vec loaded.
+        model_type: Model family whose stored embeddings should be returned.
+
+    Returns:
+        List of matching model embeddings joined with user identity and target status.
+
+    Raises:
+        ValueError: If the model type is invalid.
+    """
+    if model_type not in ("homegrown", "finetuned"):
+        raise ValueError("model_type must be either 'homegrown' or 'finetuned'")
+
+    rows = connection.execute(
+        """
+        SELECT
+            u.user_id,
+            u.name,
+            u.target,
+            ue.user_embedding_id,
+            e.embedding
+        FROM user_embeddings AS ue
+        JOIN users AS u
+            ON u.user_id = ue.user_id
+        JOIN embeddings AS e
+            ON e.rowid = ue.embedding_id
+        WHERE ue.model_type = ?
+        ORDER BY ue.user_embedding_id
+        """,
+        (model_type,),
+    ).fetchall()
+    return [
+        StoredUserEmbedding(
+            user_id=int(row[0]),
+            name=str(row[1]),
+            target=bool(row[2]),
+            user_embedding_id=int(row[3]),
+            embedding=deserialize_embedding(row[4]),
+        )
+        for row in rows
+    ]
+
+
 def serialize_embedding(embedding: Iterable[float]) -> bytes:
     """
     Validate and serialize a 256-dimensional embedding for sqlite-vec storage.
@@ -191,3 +263,22 @@ def serialize_embedding(embedding: Iterable[float]) -> bytes:
     if len(values) != EMBEDDING_DIM:
         raise ValueError(f"Embedding must contain exactly {EMBEDDING_DIM} values")
     return _get_sqlite_vec().serialize_float32(values)
+
+
+def deserialize_embedding(serialized_embedding: bytes) -> tuple[float, ...]:
+    """
+    Deserialize a sqlite-vec float32 embedding blob into Python float values.
+
+    Args:
+        serialized_embedding: Raw bytes read from the sqlite-vec embedding column.
+
+    Returns:
+        Tuple containing exactly 256 speaker embedding values.
+
+    Raises:
+        ValueError: If the serialized embedding does not contain exactly 256 float values.
+    """
+    values = np.frombuffer(serialized_embedding, dtype=np.float32).astype(float)
+    if values.size != EMBEDDING_DIM:
+        raise ValueError(f"Serialized embedding must contain exactly {EMBEDDING_DIM} values")
+    return tuple(float(value) for value in values)
