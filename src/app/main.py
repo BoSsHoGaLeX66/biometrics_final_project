@@ -4,7 +4,7 @@ from typing import Any
 import os
 import sys
 
-PROJECT_PATH = "/home/alexsearle/Documents/Bucknell/SP26/Biometrics/biometrics_final_project"
+PROJECT_PATH = "/Users/masonbarlow/PycharmProjects/biometrics_final_project"
 if str(PROJECT_PATH) not in sys.path:
     sys.path.append(PROJECT_PATH)
 

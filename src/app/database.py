@@ -76,20 +76,12 @@ def _get_sqlite_vec():
 
 
 def connect_database(database_path: str | Path) -> sqlite3.Connection:
-    """
-    Open a SQLite database connection and load the sqlite-vec extension.
-
-    Args:
-        database_path: Filesystem path for the SQLite database.
-
-    Returns:
-        SQLite connection configured with foreign keys and sqlite-vec support.
-    """
     connection = sqlite3.connect(database_path)
     connection.execute("PRAGMA foreign_keys = ON")
     connection.enable_load_extension(True)
     _get_sqlite_vec().load(connection)
     connection.enable_load_extension(False)
+
     return connection
 
 

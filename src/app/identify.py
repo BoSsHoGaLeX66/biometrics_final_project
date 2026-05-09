@@ -3,12 +3,16 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+import serial
+import time
 
 from src.app.database import ModelType, StoredUserEmbedding, connect_database, get_all_user_embeddings
 
+ser = serial.Serial("/dev/cu.usbmodem1101", 115200, timeout=1)
+time.sleep(2)
 
 DEFAULT_DATABASE_PATH = Path("data/speaker_embeddings.db")
-IDENTIFICATION_THRESHOLD = 0.9
+IDENTIFICATION_THRESHOLD = 0.7
 _database_path = DEFAULT_DATABASE_PATH
 _model_type: ModelType = "homegrown"
 
@@ -62,6 +66,9 @@ def set_model_type(model_type: ModelType) -> None:
 
 
 def identify(features: torch.Tensor) -> IdentifiedUser | None:
+    PORT = "/dev/cu.usbmodem1101"
+    BAUD = 115200
+
     """
     Identify a registered user by comparing a voice embedding to stored embeddings.
 
@@ -92,6 +99,13 @@ def identify(features: torch.Tensor) -> IdentifiedUser | None:
         return None
 
     target_status = "yes" if best_match.target else "no"
+
+    ser.write(b"HIGH\n")
+    print("GPIO HIGH")
+    time.sleep(3)
+    ser.write(b"LOW\n")
+
+
     print(f"Identity: {best_match.name}. Target: {target_status}. Similarity: {best_match.similarity:.3f}.")
     return best_match
 
