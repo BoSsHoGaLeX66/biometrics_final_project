@@ -103,7 +103,6 @@ msgpack==1.1.2
 multidict==6.7.1
 multiprocess==0.70.19
 multitasking==0.0.13
--e file:///home/alexsearle/Documents/Bucknell/SP26/Biometrics/biometrics_final_project
 narwhals==2.20.0
 nbclient==0.10.4
 nbconvert==7.17.1
